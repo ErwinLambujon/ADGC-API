@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+numpy
+opencv-python-headless==4.8.0.76
+pillow
+python-multipart
+torch
+ultralytics
