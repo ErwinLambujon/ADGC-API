@@ -21,6 +21,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+def preload_model():
+    load_model()
+
 # ✅ Lazy-load the YOLOv8 model
 @lru_cache()
 def load_model():
@@ -75,7 +79,9 @@ async def detect_gallstones(file: UploadFile = File(...), return_image: Optional
 
     with torch.no_grad():
         model = load_model()  # ✅ Lazy-load model
-        results = model(img_array_bgr, imgsz=640)  # ✅ Force 640x640 input size
+        print("🔁 Running model inference...")
+        results = model(img_array_bgr, imgsz=640)  # ✅ Force 640x640 input siz
+        print("✅ Inference complete")  
 
     if not results:
         return JSONResponse(
