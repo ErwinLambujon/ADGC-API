@@ -1,117 +1,108 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
+from functools import lru_cache
+
 import io
 import cv2
 import numpy as np
 import torch
 from PIL import Image
-import torch.nn as nn
 from ultralytics import YOLO
 
 app = FastAPI()
 
-# Load your YOLOv8 model (assuming this is already done in your application)
-model = YOLO('best.pt')
-model.eval()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Restrict this in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ✅ Lazy-load the YOLOv8 model
+@lru_cache()
+def load_model():
+    model = YOLO('best.pt')
+    model.eval()
+    return model
 
 def render_without_confidence(img, detections, class_names):
-    """Draw bounding boxes on image without confidence scores or labels"""
-    # Clone the image to avoid modifying the original
     img_with_boxes = img.copy()
-    
-    # Process each detection
     for i in range(len(detections)):
-        box = detections.xyxy[i].cpu().numpy()  # Get bounding box coordinates
+        box = detections.xyxy[i].cpu().numpy()
         x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-        
-        # Draw bounding box only - no label
         cv2.rectangle(img_with_boxes, (x1, y1), (x2, y2), (0, 255, 0), 2)
-    
     return img_with_boxes
 
 def is_valid_ultrasound(img_array):
-    # Convert to grayscale if not already
     if len(img_array.shape) == 3:
         gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
     else:
         gray = img_array
-    
-    # Check 1: Ultrasound images typically have black borders/regions
+
     black_pixel_ratio = np.sum(gray < 30) / gray.size
-    if black_pixel_ratio < 0.1:  # Ultrasounds typically have some black regions
+    if black_pixel_ratio < 0.1:
         return False
-    
-    # Check 2: Check for brightness distribution
+
     hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
     hist_normalized = hist / hist.sum()
-    
-    # Ultrasounds typically have specific brightness distribution
-    if np.var(hist_normalized) < 0.0001:  # Too uniform distribution
+    if np.var(hist_normalized) < 0.0001:
         return False
-    
+
     return True
 
 @app.post("/detect/")
 async def detect_gallstones(file: UploadFile = File(...), return_image: Optional[bool] = True):
-    # Validate and read uploaded image
     contents = await file.read()
     if not contents:
         raise HTTPException(status_code=400, detail="No image data provided")
-    
+
     try:
         image = Image.open(io.BytesIO(contents)).convert("RGB")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
-    
-    # Convert to numpy array and change color format
+
     img_array = np.array(image)
     img_array_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-    
-    # Check if image appears to be an ultrasound before running the model
+
     if not is_valid_ultrasound(img_array_bgr):
-        # Not a valid ultrasound image
         return JSONResponse(
             content={"error": "The uploaded image does not appear to be an ultrasound"},
-            status_code=415  # Unsupported Media Type
+            status_code=415
         )
-    
-    # Only run the model if we believe it's an ultrasound
+
     with torch.no_grad():
-        results = model(img_array_bgr)
-    
-    # Process valid ultrasound image
+        model = load_model()  # ✅ Lazy-load model
+        results = model(img_array_bgr, imgsz=640)  # ✅ Force 640x640 input size
+
     if not results:
-        # Model failed to return results
         return JSONResponse(
             content={"error": "No results returned from the model"},
-            status_code=500  # Internal Server Error
+            status_code=500
         )
-    
+
     result = results[0]
     detections = result.boxes
     class_names = result.names
-    
+
     if len(detections) > 0:
-        # Gallstones detected
-        # Calculate average confidence
         confidences = detections.conf.cpu().numpy()
         avg_confidence = float(np.mean(confidences) * 100)
-        
-        # Process detection results
+
         detection_results = {
             "gallstones_detected": True,
             "average_confidence": round(avg_confidence, 2),
             "count": len(detections),
             "detections": []
         }
-        
-        # Add details for each detection
+
         for i in range(len(detections)):
             box = detections.xyxy[i].cpu().numpy()
             cls = int(detections.cls[i].item())
             conf = float(detections.conf[i].item())
-            
+
             detection_results["detections"].append({
                 "class": class_names[cls],
                 "confidence": round(conf * 100, 2),
@@ -122,19 +113,16 @@ async def detect_gallstones(file: UploadFile = File(...), return_image: Optional
                     "y2": int(box[3])
                 }
             })
-        
+
         if return_image:
-            # Draw bounding boxes on image (without text labels)
             detected_img = render_without_confidence(img_array_bgr.copy(), detections, class_names)
             detected_img = cv2.cvtColor(detected_img, cv2.COLOR_BGR2RGB)
-            
-            # Convert to PIL Image and then to bytes
+
             detected_pil = Image.fromarray(detected_img)
             img_byte_arr = io.BytesIO()
             detected_pil.save(img_byte_arr, format='JPEG')
             img_byte_arr = img_byte_arr.getvalue()
-            
-            # Return image with detections
+
             return Response(
                 content=img_byte_arr,
                 media_type="image/jpeg", 
@@ -146,13 +134,16 @@ async def detect_gallstones(file: UploadFile = File(...), return_image: Optional
         else:
             return JSONResponse(content=detection_results)
     else:
-        # No gallstones detected - return 204 No Content
         return Response(
             status_code=204,
             headers={"X-Message": "No Gallstones Detected"}
         )
 
-# Add endpoint to get just the JSON results without the image
 @app.post("/detect-json/")
 async def detect_gallstones_json(file: UploadFile = File(...)):
     return await detect_gallstones(file, return_image=False)
+
+# ✅ Health check endpoint for testing server status
+@app.get("/health")
+def health():
+    return {"status": "ok"}
